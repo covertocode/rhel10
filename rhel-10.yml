@@ -1,0 +1,299 @@
+---
+Description: An EC2 instance running the latest Red Hat Enterprise Linux 10 AMI in the current region (resolved at deploy time); includes a security group allowing TCP traffic on port 80, and an IAM role with permissions for Systems Manager.
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 key pair in this region, used for SSH access.
+    Type: AWS::EC2::KeyPair::KeyName
+
+  SshCidr:
+    Description: IPv4 CIDR range allowed to connect over SSH (port 22). The default 0.0.0.0/0 allows SSH from anywhere; restrict it (for example 203.0.113.10/32) where possible.
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be an IPv4 CIDR range such as 203.0.113.10/32.
+
+  AmiNamePattern:
+    Description: Name filter used to find the RHEL 10 x86_64 AMI. The newest matching image (by creation date) is used.
+    Type: String
+    Default: RHEL-10*_HVM-*-x86_64-*-Hourly2-GP3
+
+  AmiLookupVersion:
+    Description: Change this value (for example to a date) on a stack update to re-run the AMI lookup and pick up a newer AMI. WARNING - a new AMI replaces the instance.
+    Type: String
+    Default: "1"
+
+  InstanceType:
+    Description: The size to use for the EC2 instance
+    Type: String
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+    Default: t3.small
+    ConstraintDescription: Must be a valid EC2 instance type.
+
+Conditions:
+  IsGovCloud: !Equals [!Ref "AWS::Partition", aws-us-gov]
+
+Resources:
+  # --- Latest RHEL 10 AMI lookup (custom resource) -------------------------
+  # Red Hat does not publish RHEL AMI IDs as public SSM parameters, so a small
+  # Lambda calls ec2:DescribeImages against Red Hat's publisher account and
+  # returns the newest matching image in the current region.
+  AmiLookupFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  AmiLookupFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: AmiLookup
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: ec2:DescribeImages
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt AmiLookupFunctionLogGroup.Arn
+
+  AmiLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Finds the newest RHEL 10 AMI in this region
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt AmiLookupFunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref AmiLookupFunctionLogGroup
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, event["PhysicalResourceId"])
+                      return
+                  props = event["ResourceProperties"]
+                  ec2 = boto3.client("ec2")
+                  images = ec2.describe_images(
+                      Owners=[props["Owner"]],
+                      Filters=[
+                          {"Name": "name", "Values": [props["NamePattern"]]},
+                          {"Name": "architecture", "Values": [props["Architecture"]]},
+                          {"Name": "virtualization-type", "Values": ["hvm"]},
+                          {"Name": "root-device-type", "Values": ["ebs"]},
+                          {"Name": "state", "Values": ["available"]},
+                      ],
+                  )["Images"]
+                  if not images:
+                      raise RuntimeError("No AMI matched %r in this region" % props["NamePattern"])
+                  latest = max(images, key=lambda i: i["CreationDate"])
+                  data = {
+                      "ImageId": latest["ImageId"],
+                      "Name": latest["Name"],
+                      "RootDeviceName": latest["RootDeviceName"],
+                  }
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, data, latest["ImageId"])
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)}, event.get("PhysicalResourceId", "AmiLookup"))
+
+  LatestRhel10Ami:
+    Type: Custom::AmiLookup
+    Properties:
+      ServiceToken: !GetAtt AmiLookupFunction.Arn
+      # Red Hat's AMI publisher account (commercial regions / GovCloud).
+      Owner: !If [IsGovCloud, "219670896067", "309956199498"]
+      NamePattern: !Ref AmiNamePattern
+      Architecture: x86_64
+      Version: !Ref AmiLookupVersion
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref Role
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow TCP traffic on port 80 and SSH from a trusted CIDR
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: !Ref SshCidr
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          Description: SSH from trusted CIDR
+
+  Server:
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          application_installation:
+            - install_cfn
+            - install_apps
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.Server.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource Server --configsets application_installation --region ${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/systemd/system/cfn-hup.service:
+              content: |
+                [Unit]
+                Description=cfn-hup daemon
+                After=network.target
+
+                [Service]
+                Type=simple
+                ExecStart=/opt/aws/bin/cfn-hup
+                Restart=always
+
+                [Install]
+                WantedBy=multi-user.target
+              mode: "000644"
+              owner: root
+              group: root
+          commands:
+            00cfn_hup_daemon_reload:
+              command: systemctl daemon-reload
+            01cfn_hup_enable:
+              command: systemctl enable cfn-hup.service
+            02cfn_hup_start:
+              command: systemctl start cfn-hup.service
+        install_apps:
+          packages:
+            yum:
+              git: []
+              java-21-openjdk-devel: []
+              python3-pip: []
+          commands:
+            01_install_ssm_agent:
+              command: !Sub |
+                dnf install -y https://s3.${AWS::Region}.${AWS::URLSuffix}/amazon-ssm-${AWS::Region}/latest/linux_amd64/amazon-ssm-agent.rpm
+            02_enable_ssm_agent:
+              command: systemctl enable amazon-ssm-agent && systemctl start amazon-ssm-agent
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: !GetAtt LatestRhel10Ami.ImageId
+      BlockDeviceMappings:
+        - DeviceName: !GetAtt LatestRhel10Ami.RootDeviceName
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+            DeleteOnTermination: true
+      IamInstanceProfile: !Ref Profile
+      SecurityGroups:
+        - !Ref SecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+      UserData: !Base64
+        Fn::Sub: |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log) 2>&1
+
+          # RHEL provides venv in python3; keep bootstrap dependencies isolated.
+          dnf install -y python3 python3-pip
+
+          CFN_VENV=/opt/aws/cfn-bootstrap
+          python3 -m venv "$CFN_VENV"
+          "$CFN_VENV/bin/pip" install --upgrade pip
+          # setuptools 82+ drops pkg_resources; aws-cfn-bootstrap still imports it — pin setuptools in the same resolve.
+          "$CFN_VENV/bin/pip" install "setuptools>=69,<82" \
+            https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+
+          mkdir -p /opt/aws/bin
+          for f in cfn-init cfn-hup cfn-signal; do
+            ln -sf "$CFN_VENV/bin/$f" /opt/aws/bin/$f
+          done
+
+          # Report cfn-init failures even with bash errexit enabled.
+          trap 'rc=$?; /opt/aws/bin/cfn-signal -e "$rc" --stack ${AWS::StackName} --region ${AWS::Region} --resource Server' EXIT
+
+          /opt/aws/bin/cfn-init -v \
+            --stack ${AWS::StackName} \
+            --region ${AWS::Region} \
+            --resource Server \
+            --configsets application_installation
+
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref Server
+
+Outputs:
+  AmiId:
+    Description: RHEL 10 AMI selected for this region
+    Value: !GetAtt LatestRhel10Ami.ImageId
+  AmiName:
+    Description: Name of the selected AMI
+    Value: !GetAtt LatestRhel10Ami.Name
+  TerminalURL:
+    Description: Follow this URL to open a terminal on the server
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${Server}?region=${AWS::Region}
+  SshCommand:
+    Description: SSH command to connect to the instance (default RHEL user is ec2-user)
+    Value: !Sub ssh -i ${KeyName}.pem ec2-user@${ElasticIP}
+  SsmCommand:
+    Description: AWS CLI SSM command to connect to the instance
+    Value: !Sub |
+      aws ssm start-session --target ${Server}
